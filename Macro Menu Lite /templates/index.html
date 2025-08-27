@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Macro Menu Lite</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>Macro Menu Lite</h1>
+        <p>Filter restaurant items for cutting or bulking.</p>
+      </div>
+      <a class="link" href="#" onclick="location.reload()">Refresh</a>
+    </header>
+
+    <!-- Controls -->
+    <div class="controls">
+      <div class="row">
+        <div class="seg">
+          <label>Goal</label>
+          <div class="btns">
+            <button id="btn-cut"  class="btn primary">Cut</button>
+            <button id="btn-bulk" class="btn">Bulk</button>
+          </div>
+        </div>
+        <div class="seg">
+          <label>Restaurant</label>
+          <select id="chain"></select>
+        </div>
+        <div class="seg">
+          <label>Search</label>
+          <input id="query" placeholder="item name" />
+        </div>
+      </div>
+      <div class="row">
+        <div class="seg">
+          <label>Min Protein (g)</label>
+          <input id="minProtein" type="number" />
+        </div>
+        <div class="seg">
+          <label>Calories</label>
+          <div class="dual">
+            <input id="calMin" type="number" />
+            <span>–</span>
+            <input id="calMax" type="number" />
+          </div>
+        </div>
+        <div class="seg">
+          <label>Min Protein / 100 kcal</label>
+          <input id="minProt100" type="number" />
+        </div>
+        <div class="seg">
+          <label>Sort</label>
+          <select id="sortBy">
+            <option value="macro">Macro Score</option>
+            <option value="prot100">Protein / 100 kcal</option>
+            <option value="calories">Calories (asc)</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- Results -->
+    <div id="cards" class="cards"></div>
+    <div id="empty" class="empty" style="display:none;">
+      Nothing meets your filters. Loosen protein density or widen calories.
+    </div>
+
+    <footer>
+      <small>Macro Score = z-score blend normalized to <b>0–100</b> (protein/fiber density − sat fat, sugar, sodium per-100kcal).</small>
+    </footer>
+  </div>
+
+  <script>
+    // --- Utility ---
+    const $ = (id) => document.getElementById(id);
+    const state = {
+      goal: 'cut', chain: 'All', query: '',
+      minProtein: 25, calMin: 250, calMax: 700, minProt100: 6,
+      sortBy: 'macro', items: []
+    };
+
+    function toNum(x){ const n = Number(x); return Number.isFinite(n) ? n : 0; }
+
+    // Compute raw features only; scoring will be normalized across the dataset
+    function computeFields(r){
+      const calories = toNum(r.calories);
+      const protein_g = toNum(r.protein_g ?? r.protein);
+      const carbs_g   = toNum(r.carbs_g   ?? r.carbohydrates);
+      const fat_g     = toNum(r.fat_g     ?? r.total_fat);
+      const fiber_g   = r.fiber_g != null ? toNum(r.fiber_g ?? r.dietary_fiber) : toNum(r.dietary_fiber);
+      const sugar_g   = r.sugar_g != null ? toNum(r.sugar_g ?? r.sugar) : toNum(r.sugar);
+      const satfat_g  = r.satfat_g != null ? toNum(r.satfat_g ?? r.saturated_fat) : toNum(r.saturated_fat);
+      const sodium_mg = r.sodium_mg != null ? toNum(r.sodium_mg ?? r.sodium) : toNum(r.sodium);
+
+      const prot100 = calories > 0 ? protein_g / (calories/100) : 0;
+      const fib100  = calories > 0 ? (fiber_g || 0) / (calories/100) : 0;
+      const sat100  = calories > 0 ? (satfat_g || 0) / (calories/100) : 0;
+      const sug100  = calories > 0 ? (sugar_g || 0) / (calories/100) : 0;
+      const sod100  = calories > 0 ? ((sodium_mg || 0) / (calories/100)) / 10 : 0;
+
+      return {
+        chain: r.chain ?? r.restaurant ?? 'Unknown',
+        name:  r.name  ?? r.item_name  ?? 'Unknown',
+        food_category: r.food_category,
+        calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, satfat_g, sodium_mg,
+        protein_per_100kcal: prot100,
+        // keep the individual densities for z-scoring later
+        _prot100: prot100, _fib100: fib100, _sat100: sat100, _sug100: sug100, _sod100: sod100,
+        macro_score: 0 // placeholder; will be filled by normalizeScores()
+      };
+    }
+
+    // --- Normalization helpers (z-score -> clipped min-max to 0-100) ---
+    function mean(arr){ return arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : 0; }
+    function stdev(arr){
+      if (!arr.length) return 1;
+      const m = mean(arr);
+      const v = arr.reduce((s,x)=>s+(x-m)*(x-m),0)/arr.length;
+      return v>0 ? Math.sqrt(v) : 1;
+    }
+    function quantile(a, q){
+      if (!a.length) return 0;
+      const s=[...a].sort((x,y)=>x-y), pos=(s.length-1)*q, base=Math.floor(pos), rest=pos-base;
+      return rest ? s[base]+rest*(s[base+1]-s[base]) : s[base];
+    }
+
+    function normalizeScores(items){
+      const P = items.map(r=>r._prot100||0);
+      const F = items.map(r=>r._fib100 ||0);
+      const SA= items.map(r=>r._sat100 ||0);
+      const SU= items.map(r=>r._sug100 ||0);
+      const SO= items.map(r=>r._sod100 ||0);
+
+      const mp=mean(P),  sp=stdev(P);
+      const mf=mean(F),  sf=stdev(F);
+      const msa=mean(SA), ssa=stdev(SA);
+      const msu=mean(SU), ssu=stdev(SU);
+      const mso=mean(SO), sso=stdev(SO);
+
+      // weights: +protein (0.60), +fiber (0.20), penalties sat(0.12), sugar(0.05), sodium(0.03)
+      const raw = items.map(r=>{
+        const pos = 0.60*((r._prot100-mp)/sp) + 0.20*((r._fib100-mf)/sf);
+        const neg = 0.12*((r._sat100-msa)/ssa) + 0.05*((r._sug100-msu)/ssu) + 0.03*((r._sod100-mso)/sso);
+        return pos - neg;
+      });
+
+      const lo = quantile(raw, 0.02), hi = quantile(raw, 0.98);
+      items.forEach((r,i)=>{
+        const clipped = Math.min(Math.max(raw[i], lo), hi);
+        r.macro_score = Math.round(((clipped - lo) / (hi - lo + 1e-12) * 100) * 10)/10; // 0–100, 0.1 precision
+      });
+    }
+
+    function applyPreset(){
+      if(state.goal === 'cut'){
+        state.minProtein = 25; state.calMin = 250; state.calMax = 700; state.minProt100 = 6;
+        $("btn-cut").classList.add("primary"); $("btn-bulk").classList.remove("primary");
+      } else {
+        state.minProtein = 30; state.calMin = 500; state.calMax = 1200; state.minProt100 = 4;
+        $("btn-bulk").classList.add("primary"); $("btn-cut").classList.remove("primary");
+      }
+      $("minProtein").value = state.minProtein;
+      $("calMin").value = state.calMin;
+      $("calMax").value = state.calMax;
+      $("minProt100").value = state.minProt100;
+    }
+
+    function render(){
+      const q = state.query.trim().toLowerCase();
+      const rows = state.items.filter(i=>{
+        if(state.chain !== 'All' && i.chain !== state.chain) return false;
+        if(i.calories < state.calMin || i.calories > state.calMax) return false;
+        if((i.protein_g||0) < state.minProtein) return false;
+        if((i.protein_per_100kcal||0) < state.minProt100) return false;
+        if(q && !( (i.name + ' ' + (i.food_category||'')).toLowerCase().includes(q) )) return false;
+        return true;
+      });
+
+      rows.sort((a,b)=>{
+        if(state.sortBy === 'macro') return (b.macro_score||0) - (a.macro_score||0);
+        if(state.sortBy === 'prot100') return (b.protein_per_100kcal||0) - (a.protein_per_100kcal||0);
+        if(state.sortBy === 'calories') return a.calories - b.calories;
+        return 0;
+      });
+
+      const host = $("cards"); host.innerHTML = "";
+      rows.forEach((r)=>{
+        const el = document.createElement("div");
+        el.className = "card";
+        el.innerHTML = `
+          <div class="card-head">
+            <span class="chain">${r.chain}</span>
+            <span class="badge">Score ${Number(r.macro_score||0).toFixed(1)}</span>
+          </div>
+          <h3 class="title">${r.name}</h3>
+          <div class="grid">
+            <span>Calories</span><span class="v">${r.calories}</span>
+            <span>Protein</span><span class="v">${r.protein_g} g</span>
+            <span>Carbs</span><span class="v">${r.carbs_g} g</span>
+            <span>Fat</span><span class="v">${r.fat_g} g</span>
+            ${r.fiber_g!=null?`<span>Fiber</span><span class="v">${r.fiber_g} g</span>`:''}
+            ${r.sugar_g!=null?`<span>Sugar</span><span class="v">${r.sugar_g} g</span>`:''}
+            ${r.satfat_g!=null?`<span>Sat Fat</span><span class="v">${r.satfat_g} g</span>`:''}
+            ${r.sodium_mg!=null?`<span>Sodium</span><span class="v">${r.sodium_mg} mg</span>`:''}
+          </div>
+          <div class="tags">
+            <span class="tag">${(r.protein_per_100kcal||0).toFixed(1)} g/100 kcal</span>
+            <span class="tag">${r.food_category||'—'}</span>
+          </div>`;
+        host.appendChild(el);
+      });
+
+      $("empty").style.display = rows.length ? "none" : "block";
+    }
+
+    // init
+    (async function init(){
+      // load data
+      const res = await fetch("/data/items");
+      const raw = await res.json();
+      state.items = raw.map(computeFields);
+
+      // normalize macro_score to 0–100 across the dataset
+      normalizeScores(state.items);
+
+      // chains
+      const chains = ["All", ...Array.from(new Set(state.items.map(d=>d.chain))).sort()];
+      const sel = $("chain"); sel.innerHTML = chains.map(c=>`<option>${c}</option>`).join("");
+      sel.value = "All";
+
+      // goal preset and listeners
+      $("btn-cut").onclick  = ()=>{ state.goal='cut'; applyPreset(); render(); };
+      $("btn-bulk").onclick = ()=>{ state.goal='bulk'; applyPreset(); render(); };
+
+      $("chain").onchange = e => { state.chain = e.target.value; render(); };
+      $("query").oninput   = e => { state.query = e.target.value; render(); };
+      $("minProtein").oninput = e => { state.minProtein = Number(e.target.value)||0; render(); };
+      $("calMin").oninput = e => { state.calMin = Number(e.target.value)||0; render(); };
+      $("calMax").oninput = e => { state.calMax = Number(e.target.value)||0; render(); };
+      $("minProt100").oninput = e => { state.minProt100 = Number(e.target.value)||0; render(); };
+      $("sortBy").onchange = e => { state.sortBy = e.target.value; render(); };
+
+      applyPreset();
+      render();
+    })();
+  </script>
+</body>
+</html>
